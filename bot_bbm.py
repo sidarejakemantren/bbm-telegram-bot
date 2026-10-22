@@ -1,162 +1,184 @@
+import logging
+import os
 import sqlite3
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import threading
+from datetime import datetime
+from flask import Flask
+from telegram import Update
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, CallbackQueryHandler,
-    MessageHandler, filters, ContextTypes, ConversationHandler
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
 )
 
-# State untuk percakapan bot
-CHOOSING_BBM, INPUT_DATA = range(2)
+# --- 1. SET UP FLASK UNTUK RENDER WEB SERVICE ---
+app_web = Flask(__name__)
 
-# --- 1. INISIALISASI DATABASE ---
+@app_web.route('/')
+def home():
+    return "Bot BBM Keluarga 24/7 Running Active!"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app_web.run(host='0.0.0.0', port=port)
+
+# --- 2. BOT TELEGRAM CODE ---
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+
+# DAFTAR ID TELEGRAM KELUARGA (WHITELIST)
+ALLOWED_USER_IDS = [
+    8849388611,  # <--- Ganti/tambahkan ID Anda di sini
+]
+
+DB_NAME = 'bbm_mobil.db'
+
 def init_db():
-    conn = sqlite3.connect('bbm_tracker.db')
+    conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute('''
-        CREATE TABLE IF NOT EXISTS bbm_logs (
+        CREATE TABLE IF NOT EXISTS pengisian_bbm (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            tanggal TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            total_rupiah REAL,
-            harga_liter REAL,
-            liter REAL,
-            odometer REAL,
-            jenis_bbm TEXT
+            tanggal TEXT NOT NULL,
+            pengguna TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            odometer INTEGER NOT NULL,
+            total_harga REAL NOT NULL,
+            harga_per_liter REAL NOT NULL,
+            liter REAL NOT NULL,
+            biaya REAL NOT NULL
         )
     ''')
     conn.commit()
     conn.close()
 
-# --- 2. PERINTAH DASAR ---
+TOKEN = '8849388611:AAEjQIUgp3laK1VMqPGIannlX-Hg4TTh5EY'
+
+def cek_akses(update: Update) -> bool:
+    return update.effective_user.id in ALLOWED_USER_IDS
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Halo! Selamat datang di Bot Pencatat BBM 🚗⛽\n\n"
-        "Gunakan perintah /catat untuk mulai mencatat pengisian bensin."
+    if not cek_akses(update):
+        await update.message.reply_text("⛔ Maaf, bot ini privat untuk keluarga.")
+        return
+    user = update.effective_user.first_name
+    pesan = (
+        f"Halo {user}! Bot Catatan BBM Mobil Aktif.\n\n"
+        "🚗 **Format Input:**\n`/isi [odometer] [total_harga] [harga_liter]`\n\n"
+        "📌 **Perintah:**\n/riwayat | /rekap | /reset"
     )
+    await update.message.reply_text(pesan, parse_mode='Markdown')
 
-async def start_catat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Tombol pilihan jenis BBM
-    keyboard = [
-        [
-            InlineKeyboardButton("Pertalite", callback_data='Pertalite'),
-            InlineKeyboardButton("Pertamax", callback_data='Pertamax')
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("Pilih jenis BBM yang Anda isi:", reply_markup=reply_markup)
-    return CHOOSING_BBM
-
-async def bbm_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    # Simpan pilihan jenis BBM ke session
-    context.user_data['jenis_bbm'] = query.data
-    
-    await query.edit_message_text(
-        text=f"Anda memilih: **{query.data}**\n\n"
-             f"Silakan kirimkan data dengan format (pisahkan dengan spasi):\n"
-             f"`[Total Rupiah] [Harga per Liter] [KM Mobil]`\n\n"
-             f"*Contoh:* `150000 13300 45250`",
-        parse_mode='Markdown'
-    )
-    return INPUT_DATA
-
-# --- 3. PEMROSESAN DATA & PERHITUNGAN OTOMATIS ---
-async def process_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    text = update.message.text.split()
-    
-    if len(text) != 3:
-        await update.message.reply_text(
-            "⚠️ Format salah! Masukkan tepat 3 angka pisahkan dengan spasi.\n"
-            "Contoh: `150000 13300 45250`", 
-            parse_mode='Markdown'
-        )
-        return INPUT_DATA
-
+async def isi_bbm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not cek_akses(update):
+        return
+    args = context.args
+    if len(args) < 3:
+        await update.message.reply_text("⚠️ Format: `/isi [odometer] [total_harga] [harga_liter]`", parse_mode='Markdown')
+        return
     try:
-        total_rupiah = float(text[0])
-        harga_liter = float(text[1])
-        odometer = float(text[2])
-        jenis_bbm = context.user_data.get('jenis_bbm', 'Unknown')
-        
-        # Konversi Rupiah ke Liter otomatis
-        liter = total_rupiah / harga_liter
+        odometer = int(args[0].replace('.', '').replace(',', ''))
+        total_harga = float(args[1].replace('.', '').replace(',', ''))
+        harga_per_liter = float(args[2].replace('.', '').replace(',', ''))
 
-        # Koneksi ke database untuk simpan dan cek riwayat sebelumnya
-        conn = sqlite3.connect('bbm_tracker.db')
+        user = update.effective_user
+        nama_pengguna = user.first_name or user.username or "Pengguna"
+        user_id = user.id
+        liter = total_harga / harga_per_liter
+        tanggal = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+        conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
+        cursor.execute('SELECT odometer FROM pengisian_bbm ORDER BY id DESC LIMIT 1')
+        last_row = cursor.fetchone()
         
-        # Ambil Odometer dari pengisian terakhir user ini
-        cursor.execute("SELECT odometer FROM bbm_logs WHERE user_id = ? ORDER BY id DESC LIMIT 1", (user_id,))
-        last_log = cursor.fetchone()
-        
-        # Simpan data pengisian baru ke database
         cursor.execute('''
-            INSERT INTO bbm_logs (user_id, total_rupiah, harga_liter, liter, odometer, jenis_bbm)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (user_id, total_rupiah, harga_liter, liter, odometer, jenis_bbm))
+            INSERT INTO pengisian_bbm (tanggal, pengguna, user_id, odometer, total_harga, harga_per_liter, liter, biaya)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (tanggal, nama_pengguna, user_id, odometer, total_harga, harga_per_liter, liter, total_harga))
         conn.commit()
         conn.close()
 
-        # Hitung jarak dan konsumsi BBM jika ada riwayat sebelumnya
-        analisis_text = ""
-        if last_log:
-            km_lama = last_log[0]
-            jarak = odometer - km_lama
+        info_konsumsi = ""
+        if last_row:
+            jarak = odometer - last_row[0]
             if jarak > 0 and liter > 0:
-                kml = jarak / liter
-                analisis_text = (
-                    f"\n📊 **Analisis Perjalanan:**\n"
-                    f"• Jarak Tempuh: {jarak:,.1f} KM\n"
-                    f"• Efisiensi BBM: **{kml:.2f} KM / Liter**"
-                )
-            elif jarak <= 0:
-                analisis_text = "\n⚠️ *Catatan: KM saat ini lebih kecil atau sama dengan KM sebelumnya.*"
+                info_konsumsi = f"📈 Konsumsi: **{jarak / liter:.2f} km/L** (Jarak: {jarak} km)\n"
 
-        # Susun pesan balasan ke Telegram
-        response = (
-            f"✅ **Pencatatan BBM Berhasil!**\n\n"
-            f"• Jenis BBM: {jenis_bbm}\n"
-            f"• Total Bayar: Rp {total_rupiah:,.0f}\n"
-            f"• Harga/Liter: Rp {harga_liter:,.0f}\n"
-            f"• Hasil Konversi: **{liter:.2f} Liter**\n"
-            f"• Odometer: {odometer:,.0f} KM\n"
-            f"{analisis_text}"
+        pesan_sukses = (
+            "✅ **Berhasil Dicatat!**\n\n"
+            f"📅 Tanggal: {tanggal}\n👤 Pengisi: **{nama_pengguna}**\n"
+            f"🚗 Odometer: {odometer:,} km\n💰 Total: Rp {total_harga:,.0f}\n"
+            f"⛽ Liter: **{liter:.2f} L**\n{info_konsumsi}"
         )
-        
-        await update.message.reply_text(response, parse_mode='Markdown')
-        return ConversationHandler.END
-
+        await update.message.reply_text(pesan_sukses, parse_mode='Markdown')
     except ValueError:
-        await update.message.reply_text("⚠️ Mohon masukkan angka yang valid (gunakan angka saja)!")
-        return INPUT_DATA
+        await update.message.reply_text("⚠️ Gagal memproses angka. Pastikan format angka benar.")
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Pencatatan dibatalkan.")
-    return ConversationHandler.END
+async def riwayat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not cek_akses(update): return
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('SELECT tanggal, pengguna, odometer, liter, biaya FROM pengisian_bbm ORDER BY id DESC LIMIT 5')
+    rows = cursor.fetchall()
+    conn.close()
+    if not rows:
+        await update.message.reply_text("📁 Belum ada data.")
+        return
+    teks = "📜 **5 Riwayat Terakhir:**\n\n"
+    for r in rows:
+        teks += f"📅 {r[0]} | 👤 **{r[1]}**\n🚗 {r[2]:,} km | ⛽ {r[3]:.2f} L | 💰 Rp {r[4]:,.0f}\n---\n"
+    await update.message.reply_text(teks, parse_mode='Markdown')
 
-# --- 4. MENJALANKAN BOT ---
+async def rekap(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not cek_akses(update): return
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('SELECT COUNT(*), SUM(liter), SUM(biaya), MIN(odometer), MAX(odometer) FROM pengisian_bbm')
+    total_entri, total_liter, total_biaya, min_km, max_km = cursor.fetchone()
+    conn.close()
+
+    if not total_entri:
+        await update.message.reply_text("📊 Belum ada data.")
+        return
+
+    jarak_tempuh = (max_km - min_km) if (max_km and min_km and max_km > min_km) else 0
+    rata = (jarak_tempuh / total_liter) if (total_liter and total_liter > 0 and jarak_tempuh > 0) else 0
+
+    teks = (
+        "📊 **REKAP BBM MOBIL**\n\n"
+        f"🔢 Pengisian: {total_entri} kali\n"
+        f"⛽ Total BBM: {total_liter:.2f} Liter\n"
+        f"💰 Total Pengeluaran: Rp {total_biaya:,.0f}\n"
+        f"🛣️ Jarak: {jarak_tempuh:,} km\n"
+        f"📈 Rata-rata: **{rata:.2f} km/L**"
+    )
+    await update.message.reply_text(teks, parse_mode='Markdown')
+
+async def reset_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not cek_akses(update): return
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM pengisian_bbm')
+    conn.commit()
+    conn.close()
+    await update.message.reply_text("🗑️ Data telah dibersihkan.")
+
 if __name__ == '__main__':
     init_db()
     
-    # Ganti teks di bawah ini dengan TOKEN asli dari BotFather
-    TOKEN = "8849388611:AAEjQIUgp3laK1VMqPGIannlX-Hg4TTh5EY"
-    
+    # Jalankan server web Flask di thread terpisah untuk Render
+    threading.Thread(target=run_flask, daemon=True).start()
+
+    # Jalankan Bot Telegram
     app = ApplicationBuilder().token(TOKEN).build()
-    
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler('catat', start_catat)],
-        states={
-            CHOOSING_BBM: [CallbackQueryHandler(bbm_button_click)],
-            INPUT_DATA: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_input)]
-        },
-        fallbacks=[CommandHandler('cancel', cancel)]
-    )
-    
     app.add_handler(CommandHandler('start', start))
-    app.add_handler(conv_handler)
-    
-    print("Bot BBM sedang berjalan...")
+    app.add_handler(CommandHandler('isi', isi_bbm))
+    app.add_handler(CommandHandler('riwayat', riwayat))
+    app.add_handler(CommandHandler('rekap', rekap))
+    app.add_handler(CommandHandler('reset', reset_data))
+
+    print("Bot BBM (Web Service) Berjalan...")
     app.run_polling()
